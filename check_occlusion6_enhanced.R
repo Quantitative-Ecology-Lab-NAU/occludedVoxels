@@ -1,16 +1,17 @@
-# Script for quantifying occlusion for TLS scans 
-# adapted from Andrew's script check_occlusion5
-# Written 01/15/2026 by Nate Beine 
-# Updated 06/10/2024 - added detailed comments, cleaned up code and made it hella faster, 
+# Script for quantifying occlusion for quadrats within TLS scan
+# Written 06/10/2024 by Andrew Sánchez Meador for plot level occlusion
+# Updated 01/15/2026 by Nate Beine to calculate occlusion within 1x1x1.37 m destructive 
+#sampling quadrats
+# Updated 02/10/2026 - Andrew added detailed comments, cleaned up code and made it hella faster, 
 # added more diagnostic outputs, and improved visualization 
 
 # ========================================
-# LIDAR OCCLUSION ANALYSIS - SINGLE AND BATCH PROCESSING
+# LIDAR OCCLUSION ANALYSIS - SINGLE SCAN PROCESSING
 # ========================================
 
 # BASE DIRECTORY ----
 # Set the base directory for all file paths
-BASE_DIR <- "d:/OneDrive - Northern Arizona University/Students/NBeine/NateOcclusionCode"
+BASE_DIR <- "Set_Directory_Here"
 
 # ========================================
 # USER PARAMETERS - CONFIGURE HERE
@@ -22,8 +23,8 @@ OCCLUSION_SAMPLE_RES <- 0.03 # Visualization grid resolution (coarse display onl
 NCORES <- parallelly::availableCores(logical=FALSE) - 1  # CPU cores to use (availableCores() - 1 uses all but one)
 SCANNER_HEIGHT <- 1.37      # Scanner height above ground in meters
 BUFFER_DISTANCE <- 0.1      # Buffer around MLS quadrat in meters (XY only)
-HEIGHT_LIMIT_DEFAULT <- 1.5 # Normalized height limit in meters (default quadrats)
-HEIGHT_LIMIT_IN <- 2.1      # Normalized height limit in meters (_IN quadrats)
+HEIGHT_LIMIT_DEFAULT <- 1.5 # Normalized height limit in meters (Adjust for clip height of quadrats)
+
 
 # Output options
 WRITE_STATS_FILE <- TRUE     # Write occlusion statistics to a text file (TRUE/FALSE)
@@ -54,8 +55,8 @@ Sys.setenv("PKG_LIBS" = "-fopenmp")
 sourceCpp(file.path(BASE_DIR, "check_occlusion6_enhanced.cpp"))
 
 # File paths ----
-file_tls <- file.path(BASE_DIR, "ABOR_Kaibab_CHT_17_25_registered.laz")
-file_mls <- file.path(BASE_DIR, "ABOR_Kaibab_CHT_17_25_Q4_MLS.las")
+file_tls <- file.path(BASE_DIR, "ABOR_Kaibab_CHT_17_25_registered.laz") #Rename to desired scan files
+file_mls <- file.path(BASE_DIR, "ABOR_Kaibab_CHT_17_25_Q4_MLS.las") #Rename to desired scan files
 
 # Function: get_mls_hull ----
 get_mls_hull <- function(file_path, buffer_distance) {
@@ -91,7 +92,7 @@ process_tls_file <- function(file_path, file_label, mls_hull_data, occlusion_sam
   cat("\n  Points after loading: ", nrow(las), "\n", sep="")
   
   cat("Step 2: Clipping to ray transect area...\n")
-  scanner_location <- c(0, 0, SCANNER_HEIGHT)
+  scanner_location <- c(0, 0, SCANNER_HEIGHT) #Assumes that scanner position is at roughly 0,0. Works if properly registered to MLS scan
   
   # Ensure hulls have same CRS as TLS data
   las_crs <- st_crs(las)
@@ -112,7 +113,7 @@ process_tls_file <- function(file_path, file_label, mls_hull_data, occlusion_sam
                          Y >= y_min_clip & Y <= y_max_clip)
   cat("  Points after transect area clipping: ", nrow(las), "\n", sep="")
   
-  cat("Step 3: Classifying ground...\n")
+  cat("Step 3: Classifying ground...\n") #Adjust parameters as needed 
   las <- classify_ground(las, algorithm=pmf(ws=.013, th=0.02))
   cat("  Points after ground classification: ", nrow(las), "
        Step 4: Normalizing height...
