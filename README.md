@@ -16,7 +16,8 @@ Given a voxelized point cloud and a scanner location, `occludedVoxels`:
 5. Summarizes counts (and optional volumes) of populated, empty-visible, and occluded voxels.
 
 This partitions the AOI volume into observed structure, confirmed empty space, and unobservable (masked) space.
-<img width="1498" height="673" alt="image" src="https://github.com/user-attachments/assets/c158c0a4-a11f-451d-9933-d1ef8db29859" />
+<img width="1498" height="900" alt="image" src="https://github.com/user-attachments/assets/5a812272-3a94-46e5-a0d7-c2d34dc07f95" />
+
 ## How voxel states are determined
 
 Let:
