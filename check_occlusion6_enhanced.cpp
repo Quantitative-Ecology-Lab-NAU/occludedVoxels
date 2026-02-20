@@ -5,6 +5,8 @@
 #include <string>
 #include <atomic>
 #include <cmath>
+#include <vector>
+#include <algorithm>
 using namespace Rcpp;
 
 // Type alias for voxel keys
@@ -30,40 +32,74 @@ inline VoxelKey get_voxel_key(double x, double y, double z, double voxel_size) {
 }
 
 // ============================================================
-// DDA (Amanatides-Woo) 3D ray traversal
-// Visits EVERY voxel the ray passes through - no gaps possible
-// More accurate and faster than fixed-step marching
+// Flat 3D boolean grid for O(1) obstacle lookups.
+// Replaces unordered_set for ~5-10x faster ray tracing.
+// Memory: NX * NY * NZ bytes (e.g., 500x500x150 = 37 MB).
 // ============================================================
-inline bool is_ray_occluded_dda(
+struct VoxelGrid3D {
+  std::vector<uint8_t> data;
+  int ox, oy, oz;   // origin offsets (minimum voxel index)
+  int nx, ny, nz;   // grid dimensions
+  
+  void init(int min_x, int min_y, int min_z,
+            int max_x, int max_y, int max_z) {
+    ox = min_x; oy = min_y; oz = min_z;
+    nx = max_x - min_x + 1;
+    ny = max_y - min_y + 1;
+    nz = max_z - min_z + 1;
+    data.assign((size_t)nx * ny * nz, 0);
+  }
+  
+  inline void set(int ix, int iy, int iz) {
+    int lx = ix - ox, ly = iy - oy, lz = iz - oz;
+    if (lx >= 0 && lx < nx && ly >= 0 && ly < ny && lz >= 0 && lz < nz)
+      data[(size_t)lx * ny * nz + (size_t)ly * nz + lz] = 1;
+  }
+  
+  inline bool get(int ix, int iy, int iz) const {
+    int lx = ix - ox, ly = iy - oy, lz = iz - oz;
+    if (lx < 0 || lx >= nx || ly < 0 || ly >= ny || lz < 0 || lz >= nz)
+      return false;
+    return data[(size_t)lx * ny * nz + (size_t)ly * nz + lz] != 0;
+  }
+};
+
+// ============================================================
+// DDA (Amanatides-Woo) 3D ray traversal using flat grid.
+// FAT-RAY variant: at each step, checks the traversed voxel
+// PLUS its two face-adjacent neighbors perpendicular to the
+// axis just stepped.  This closes the 1 cm inter-voxel gaps
+// that allow rays to thread between adjacent obstacle voxels
+// at oblique angles, while adding only 4 extra array lookups
+// per step (still O(1) each on the flat grid).
+//
+// "last_axis" tracks which axis was just stepped so we know
+// which plane to check perpendicular neighbors in.
+// ============================================================
+inline bool is_ray_occluded_dda_fat(
     double start_x, double start_y, double start_z,
     double end_x, double end_y, double end_z,
     double voxel_size,
-    const std::unordered_set<VoxelKey, VoxelHash>& obstacles) {
+    const VoxelGrid3D& grid) {
   
-  // Current voxel indices (scanner position)
   int ix = static_cast<int>(floor(start_x / voxel_size));
   int iy = static_cast<int>(floor(start_y / voxel_size));
   int iz = static_cast<int>(floor(start_z / voxel_size));
   
-  // Target voxel indices
   int ix_end = static_cast<int>(floor(end_x / voxel_size));
   int iy_end = static_cast<int>(floor(end_y / voxel_size));
   int iz_end = static_cast<int>(floor(end_z / voxel_size));
   
-  // If start and end are in the same voxel, nothing can block the ray
   if (ix == ix_end && iy == iy_end && iz == iz_end) return false;
   
-  // Ray direction
   double dx = end_x - start_x;
   double dy = end_y - start_y;
   double dz = end_z - start_z;
   
-  // Step direction (+1 or -1 along each axis)
   int step_x = (dx >= 0) ? 1 : -1;
   int step_y = (dy >= 0) ? 1 : -1;
   int step_z = (dz >= 0) ? 1 : -1;
   
-  // Parameter t increment for one full voxel step in each axis
   double tDeltaX, tDeltaY, tDeltaZ;
   double tMaxX, tMaxY, tMaxZ;
   
@@ -71,56 +107,114 @@ inline bool is_ray_occluded_dda(
     tDeltaX = fabs(voxel_size / dx);
     tMaxX = (dx >= 0) ? ((ix + 1) * voxel_size - start_x) / dx
                        : (ix * voxel_size - start_x) / dx;
-  } else {
-    tDeltaX = 1e30;
-    tMaxX = 1e30;
-  }
+  } else { tDeltaX = 1e30; tMaxX = 1e30; }
   
   if (dy != 0.0) {
     tDeltaY = fabs(voxel_size / dy);
     tMaxY = (dy >= 0) ? ((iy + 1) * voxel_size - start_y) / dy
                        : (iy * voxel_size - start_y) / dy;
-  } else {
-    tDeltaY = 1e30;
-    tMaxY = 1e30;
-  }
+  } else { tDeltaY = 1e30; tMaxY = 1e30; }
   
   if (dz != 0.0) {
     tDeltaZ = fabs(voxel_size / dz);
     tMaxZ = (dz >= 0) ? ((iz + 1) * voxel_size - start_z) / dz
                        : (iz * voxel_size - start_z) / dz;
-  } else {
-    tDeltaZ = 1e30;
-    tMaxZ = 1e30;
+  } else { tDeltaZ = 1e30; tMaxZ = 1e30; }
+  
+  int max_steps = abs(ix_end - ix) + abs(iy_end - iy) + abs(iz_end - iz) + 2;
+  int last_axis = -1; // 0=x, 1=y, 2=z
+  
+  for (int step = 0; step < max_steps; ++step) {
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) { ix += step_x; tMaxX += tDeltaX; last_axis = 0; }
+      else               { iz += step_z; tMaxZ += tDeltaZ; last_axis = 2; }
+    } else {
+      if (tMaxY < tMaxZ) { iy += step_y; tMaxY += tDeltaY; last_axis = 1; }
+      else               { iz += step_z; tMaxZ += tDeltaZ; last_axis = 2; }
+    }
+    
+    if (ix == ix_end && iy == iy_end && iz == iz_end) break;
+    
+    // Check the exact voxel
+    if (grid.get(ix, iy, iz)) return true;
+    
+    // Check 4 face-adjacent neighbors perpendicular to the step axis.
+    // This closes gaps at oblique angles without changing the obstacle set.
+    if (last_axis == 0) {       // stepped along X → check ±Y and ±Z
+      if (grid.get(ix, iy+1, iz) || grid.get(ix, iy-1, iz) ||
+          grid.get(ix, iy, iz+1) || grid.get(ix, iy, iz-1)) return true;
+    } else if (last_axis == 1) { // stepped along Y → check ±X and ±Z
+      if (grid.get(ix+1, iy, iz) || grid.get(ix-1, iy, iz) ||
+          grid.get(ix, iy, iz+1) || grid.get(ix, iy, iz-1)) return true;
+    } else {                    // stepped along Z → check ±X and ±Y
+      if (grid.get(ix+1, iy, iz) || grid.get(ix-1, iy, iz) ||
+          grid.get(ix, iy+1, iz) || grid.get(ix, iy-1, iz)) return true;
+    }
   }
   
-  // Maximum traversal steps (Manhattan distance + safety margin)
+  return false;
+}
+
+// ============================================================
+// DDA using hash set (kept for the legacy check_occlusion fn)
+// ============================================================
+inline bool is_ray_occluded_dda(
+    double start_x, double start_y, double start_z,
+    double end_x, double end_y, double end_z,
+    double voxel_size,
+    const std::unordered_set<VoxelKey, VoxelHash>& obstacles) {
+  
+  int ix = static_cast<int>(floor(start_x / voxel_size));
+  int iy = static_cast<int>(floor(start_y / voxel_size));
+  int iz = static_cast<int>(floor(start_z / voxel_size));
+  
+  int ix_end = static_cast<int>(floor(end_x / voxel_size));
+  int iy_end = static_cast<int>(floor(end_y / voxel_size));
+  int iz_end = static_cast<int>(floor(end_z / voxel_size));
+  
+  if (ix == ix_end && iy == iy_end && iz == iz_end) return false;
+  
+  double dx = end_x - start_x;
+  double dy = end_y - start_y;
+  double dz = end_z - start_z;
+  
+  int step_x = (dx >= 0) ? 1 : -1;
+  int step_y = (dy >= 0) ? 1 : -1;
+  int step_z = (dz >= 0) ? 1 : -1;
+  
+  double tDeltaX, tDeltaY, tDeltaZ;
+  double tMaxX, tMaxY, tMaxZ;
+  
+  if (dx != 0.0) {
+    tDeltaX = fabs(voxel_size / dx);
+    tMaxX = (dx >= 0) ? ((ix + 1) * voxel_size - start_x) / dx
+                       : (ix * voxel_size - start_x) / dx;
+  } else { tDeltaX = 1e30; tMaxX = 1e30; }
+  
+  if (dy != 0.0) {
+    tDeltaY = fabs(voxel_size / dy);
+    tMaxY = (dy >= 0) ? ((iy + 1) * voxel_size - start_y) / dy
+                       : (iy * voxel_size - start_y) / dy;
+  } else { tDeltaY = 1e30; tMaxY = 1e30; }
+  
+  if (dz != 0.0) {
+    tDeltaZ = fabs(voxel_size / dz);
+    tMaxZ = (dz >= 0) ? ((iz + 1) * voxel_size - start_z) / dz
+                       : (iz * voxel_size - start_z) / dz;
+  } else { tDeltaZ = 1e30; tMaxZ = 1e30; }
+  
   int max_steps = abs(ix_end - ix) + abs(iy_end - iy) + abs(iz_end - iz) + 2;
   
   for (int step = 0; step < max_steps; ++step) {
-    // Advance to next voxel boundary (Amanatides-Woo algorithm)
     if (tMaxX < tMaxY) {
-      if (tMaxX < tMaxZ) {
-        ix += step_x;
-        tMaxX += tDeltaX;
-      } else {
-        iz += step_z;
-        tMaxZ += tDeltaZ;
-      }
+      if (tMaxX < tMaxZ) { ix += step_x; tMaxX += tDeltaX; }
+      else               { iz += step_z; tMaxZ += tDeltaZ; }
     } else {
-      if (tMaxY < tMaxZ) {
-        iy += step_y;
-        tMaxY += tDeltaY;
-      } else {
-        iz += step_z;
-        tMaxZ += tDeltaZ;
-      }
+      if (tMaxY < tMaxZ) { iy += step_y; tMaxY += tDeltaY; }
+      else               { iz += step_z; tMaxZ += tDeltaZ; }
     }
     
-    // Stop when we reach the target voxel (don't check target itself)
     if (ix == ix_end && iy == iy_end && iz == iz_end) break;
-    
-    // Check if this voxel contains an obstacle (populated vegetation)
     if (obstacles.count(std::make_tuple(ix, iy, iz)) > 0) return true;
   }
   
@@ -243,31 +337,32 @@ IntegerVector check_occlusion(NumericMatrix voxels, NumericVector scanner_locati
 }
 
 // ============================================================
-// ACCURATE occlusion check with separate obstacle map
-// Uses Amanatides-Woo DDA ray tracing through ALL populated
-// 1cm voxels for exact voxel-level classification.
-// 
-// Key differences from check_occlusion():
-//   1. Obstacles are separate from the analysis grid - rays are
-//      blocked by ALL populated voxels (including transect vegetation
-//      between scanner and quadrat), not just those in the AOI
-//   2. Uses true DDA traversal that visits every voxel the ray
-//      passes through, with zero gaps
-//   3. Analysis at 1cm = no scaling/multiplication needed
+// ACCURATE occlusion check for single-return TLS.
+//
+// Uses backward DDA (scanner → target voxel) with a fat-ray
+// neighbor check to close 1cm inter-voxel gaps.
+//
+// At each DDA step the traversed voxel + its 4 face-adjacent
+// neighbors perpendicular to the step axis are checked.
+// This prevents oblique rays from threading through diagonal
+// gaps between adjacent obstacle voxels, ensuring contiguous
+// shadow regions behind vegetation surfaces extend properly.
+//
+// Obstacle lookup uses a flat 3D boolean array (O(1) per check,
+// cache-friendly) rather than an unordered_set.
 // ============================================================
 // [[Rcpp::export]]
 IntegerVector check_occlusion_accurate(
-    NumericMatrix analysis_grid,    // N x 4: X, Y, Z, V1(0/1) - voxels to classify
-    NumericMatrix obstacles,        // M x 3: X, Y, Z - ALL populated voxels that block rays
-    NumericVector scanner_location, 
-    double voxel_size,              // voxel size (same for analysis and obstacles)
+    NumericMatrix analysis_grid,    // N x 4: X, Y, Z, V1(0/1)
+    NumericMatrix obstacles,        // M x 3: X, Y, Z  (all populated voxels)
+    NumericVector scanner_location,
+    double voxel_size,
     int ncores) {
   
   int n = analysis_grid.nrow();
   int m = obstacles.nrow();
   
-  // --- Copy Rcpp data into plain C++ containers (R-API-free) ---
-  // This prevents R's stack-limit check from firing inside OpenMP threads
+  // --- Copy Rcpp data into plain C++ containers ---
   std::vector<double> grid_x(n), grid_y(n), grid_z(n), grid_v(n);
   for (int i = 0; i < n; ++i) {
     grid_x[i] = analysis_grid(i, 0);
@@ -278,38 +373,69 @@ IntegerVector check_occlusion_accurate(
   double scan_x = scanner_location[0];
   double scan_y = scanner_location[1];
   double scan_z = scanner_location[2];
-  std::vector<int> res(n, 0);  // plain C++ result vector
+  std::vector<int> res(n, 0);
   
-  // Build obstacle hash set from ALL populated voxels (entire clip area)
-  // This includes vegetation between scanner and quadrat that blocks rays
-  std::unordered_set<VoxelKey, VoxelHash> obstacle_set;
-  obstacle_set.reserve(m);
+  // --- Compute bounding box over all coordinates ---
+  int min_ix = static_cast<int>(floor(scan_x / voxel_size));
+  int max_ix = min_ix;
+  int min_iy = static_cast<int>(floor(scan_y / voxel_size));
+  int max_iy = min_iy;
+  int min_iz = static_cast<int>(floor(scan_z / voxel_size));
+  int max_iz = min_iz;
   
   for (int i = 0; i < m; ++i) {
-    auto key = get_voxel_key(obstacles(i, 0), obstacles(i, 1), obstacles(i, 2), voxel_size);
-    obstacle_set.insert(key);
+    int ix = static_cast<int>(floor(obstacles(i, 0) / voxel_size));
+    int iy = static_cast<int>(floor(obstacles(i, 1) / voxel_size));
+    int iz = static_cast<int>(floor(obstacles(i, 2) / voxel_size));
+    if (ix < min_ix) min_ix = ix; if (ix > max_ix) max_ix = ix;
+    if (iy < min_iy) min_iy = iy; if (iy > max_iy) max_iy = iy;
+    if (iz < min_iz) min_iz = iz; if (iz > max_iz) max_iz = iz;
   }
+  for (int i = 0; i < n; ++i) {
+    int ix = static_cast<int>(floor(grid_x[i] / voxel_size));
+    int iy = static_cast<int>(floor(grid_y[i] / voxel_size));
+    int iz = static_cast<int>(floor(grid_z[i] / voxel_size));
+    if (ix < min_ix) min_ix = ix; if (ix > max_ix) max_ix = ix;
+    if (iy < min_iy) min_iy = iy; if (iy > max_iy) max_iy = iy;
+    if (iz < min_iz) min_iz = iz; if (iz > max_iz) max_iz = iz;
+  }
+  
+  // Extra margin for fat-ray neighbor checks (2 voxels)
+  min_ix -= 2; min_iy -= 2; min_iz -= 2;
+  max_ix += 2; max_iy += 2; max_iz += 2;
+  
+  // --- Build flat obstacle grid ---
+  VoxelGrid3D obstacle_grid;
+  obstacle_grid.init(min_ix, min_iy, min_iz, max_ix, max_iy, max_iz);
+  for (int i = 0; i < m; ++i) {
+    int ix = static_cast<int>(floor(obstacles(i, 0) / voxel_size));
+    int iy = static_cast<int>(floor(obstacles(i, 1) / voxel_size));
+    int iz = static_cast<int>(floor(obstacles(i, 2) / voxel_size));
+    obstacle_grid.set(ix, iy, iz);
+  }
+  
+  size_t grid_bytes = (size_t)obstacle_grid.nx * obstacle_grid.ny * obstacle_grid.nz;
+  Rcout << "       Obstacle grid: " << obstacle_grid.nx << " x "
+        << obstacle_grid.ny << " x " << obstacle_grid.nz
+        << " (" << (grid_bytes / (1024*1024)) << " MB)\n";
+  Rcout.flush();
   
   omp_set_num_threads(ncores > 1 ? ncores : 1);
   
-  // --- OpenMP region: only plain C++ data is touched ---
-  // NO R API calls (Rprintf, Rcout, etc.) inside the parallel region
-  // to avoid "C stack usage too close to the limit" on OpenMP thread stacks
+  // --- Backward fat-ray DDA for each analysis voxel ---
 #pragma omp parallel for schedule(dynamic, 1024) if(ncores > 1)
   for (int i = 0; i < n; ++i) {
     if (grid_v[i] > 0) {
-      res[i] = 1;  // Populated (has actual point cloud data)
+      res[i] = 1;  // Populated: scanner got a return here
     } else {
-      // DDA ray trace from scanner through ALL vegetation obstacles
-      bool blocked = is_ray_occluded_dda(
+      bool blocked = is_ray_occluded_dda_fat(
         scan_x, scan_y, scan_z,
         grid_x[i], grid_y[i], grid_z[i],
-        voxel_size, obstacle_set);
-      res[i] = blocked ? 2 : 0;  // 2 = occluded, 0 = empty visible
+        voxel_size, obstacle_grid);
+      res[i] = blocked ? 2 : 0;
     }
   }
   
-  // --- Copy results back to Rcpp IntegerVector ---
   IntegerVector result(n);
   for (int i = 0; i < n; ++i) result[i] = res[i];
   return result;
